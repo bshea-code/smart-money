@@ -959,10 +959,17 @@ def _fetch_etf_exposure(ticker: str) -> list:
 
 
 def get_etf_exposure_batch(ticker_list: list, cache: dict) -> dict:
-    """Fetch ETF exposure for each ticker (7-day cache)."""
+    """Fetch ETF exposure for each ticker (7-day cache).
+    Skips re-fetching in CI environments where etfdb.com blocks cloud IPs."""
+    import os
+    in_ci = os.environ.get("CI") == "true"
     results = {}
-    stale = [t for t in ticker_list
-             if not _cache_fresh(cache.get(f"_etf_{t}", {}), ttl_days=7)]
+    if in_ci:
+        print("  ETF fetch skipped in CI (etfdb.com blocks cloud IPs); using cached data.")
+        stale = []
+    else:
+        stale = [t for t in ticker_list
+                 if not _cache_fresh(cache.get(f"_etf_{t}", {}), ttl_days=7)]
     if stale:
         print(f"  Fetching ETF exposure for {len(stale)} stocks ...")
         for i, t in enumerate(stale):

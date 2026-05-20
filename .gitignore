@@ -1,6 +1,5 @@
 __pycache__/
 *.pyc
-fund_cache.json
 overlap.html
 overlap.csv
 overlap_run.log

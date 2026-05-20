@@ -43,6 +43,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add fund_cache.json
           git diff --staged --quiet || git commit -m "chore: update fund cache"
+          git pull --rebase
           git push
 
       # Publish overlap.html as index.html to the gh-pages branch

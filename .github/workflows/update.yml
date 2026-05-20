@@ -1,0 +1,67 @@
+name: Update Smart Money Overlap
+
+on:
+  schedule:
+    # Every Monday at 2pm UTC — well after any weekend SEC filings settle
+    - cron: '0 14 * * 1'
+  workflow_dispatch:  # also allows manual trigger from the GitHub UI
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Restore the data cache from the most recent previous run.
+      # A new cache entry is saved after each successful run so it never goes stale.
+      - name: Restore fund cache
+        uses: actions/cache@v4
+        with:
+          path: fund_cache.json
+          key: fund-cache-${{ github.run_number }}
+          restore-keys: |
+            fund-cache-
+
+      - name: Run overlap script
+        run: python -u overlap.py
+
+      - name: Save fund cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: fund_cache.json
+          key: fund-cache-${{ github.run_number }}
+
+      # Publish overlap.html as index.html to the gh-pages branch
+      - name: Prepare site
+        run: |
+          mkdir -p _site
+          cp overlap.html _site/index.html
+          cp overlap.csv  _site/overlap.csv
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./_site
+          commit_message: 'chore: update overlap report'

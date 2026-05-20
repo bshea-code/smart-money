@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+fund_cache.json
+overlap.html
+overlap.csv
+overlap_run.log
+run_out.txt
+test_figi.py

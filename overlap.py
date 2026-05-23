@@ -892,6 +892,56 @@ def _safe_float(v):
         return None
 
 
+# ── Annual financials (for valuation change computation) ─────────────────────
+
+def get_annual_financials(ticker_list: list, cache: dict) -> dict:
+    """
+    Fetch the two most recent annual income statements per ticker.
+    Stores yr0 (most recent fiscal year) and yr1 (prior year) revenue and net income.
+    Used to compute YoY change in P/E and P/S without requiring cached snapshots.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        return {}
+
+    stale = [t for t in ticker_list
+             if not _cache_fresh(cache.get(f"_fin_{t}", {}), ttl_days=7)]
+    if stale:
+        print(f"  Fetching annual financials for {len(stale)} stocks ...")
+        for t in stale:
+            try:
+                stmt = yf.Ticker(t).income_stmt
+                if stmt is None or stmt.empty:
+                    continue
+                cols = [c for c in stmt.columns]  # newest first
+
+                def _val(col, *keys):
+                    for k in keys:
+                        try:
+                            v = stmt.loc[k, col]
+                            if v is not None and v == v:  # not NaN
+                                return float(v)
+                        except (KeyError, TypeError):
+                            pass
+                    return None
+
+                entry = {"_ts": datetime.now().isoformat()}
+                for i, col in enumerate(cols[:2]):
+                    yr = f"yr{i}"
+                    entry[f"{yr}_revenue"]    = _val(col, "Total Revenue", "Revenue",
+                                                      "Operating Revenue")
+                    entry[f"{yr}_net_income"] = _val(col, "Net Income",
+                                                      "Net Income From Continuing Operations",
+                                                      "Net Income Common Stockholders")
+                    entry[f"{yr}_date"] = str(col)[:10]
+                cache[f"_fin_{t}"] = entry
+            except Exception as exc:
+                print(f"    [{t}] financials error: {exc}", file=sys.stderr)
+
+    return {t: cache.get(f"_fin_{t}", {}) for t in ticker_list}
+
+
 # ── ETF exposure ──────────────────────────────────────────────────────────────
 
 _DERIVATIVE_ETF_WORDS = {
@@ -1179,8 +1229,9 @@ def compute_aggregate_changes(overlap: list, fund_data: dict, all_cfg: dict,
                                cache: dict) -> dict:
     """
     Returns {cusip: {"ytd_delta": float|None, "y1_delta": float|None}}.
-    Values are changes in aggregate portfolio weight (sum of % across all funds, in pp).
-    Positive = funds collectively added; negative = reduced.
+    Values are % change in aggregate portfolio weight (sum of % across all funds).
+    +50 = funds collectively increased their weight in this stock by 50%.
+    New positions (prior weight = 0) return 999 as a sentinel.
     """
     print("Computing aggregate ownership changes ...")
     today = datetime.now().date()
@@ -1191,6 +1242,11 @@ def compute_aggregate_changes(overlap: list, fund_data: dict, all_cfg: dict,
     for fn, info in fund_data.items():
         cfg = all_cfg.get(fn, {})
         fund_quarters[fn] = fetch_multi_quarter_holdings(fn, cfg, cache)
+
+    def _pct_chg(current, prior):
+        if prior > 0:
+            return (current - prior) / prior * 100
+        return 999.0 if current > 0 else 0.0
 
     results = {}
     for cusip, data in overlap:
@@ -1207,8 +1263,8 @@ def compute_aggregate_changes(overlap: list, fund_data: dict, all_cfg: dict,
                 y1_agg += q_y1["holdings"].get(cusip, {}).get("pct", 0.0)
                 y1_found = True
         results[cusip] = {
-            "ytd_delta": (current_agg - ytd_agg) if ytd_found else None,
-            "y1_delta":  (current_agg - y1_agg)  if y1_found  else None,
+            "ytd_delta": _pct_chg(current_agg, ytd_agg) if ytd_found else None,
+            "y1_delta":  _pct_chg(current_agg, y1_agg)  if y1_found  else None,
         }
     return results
 
@@ -1248,45 +1304,55 @@ def pick_smart_valuation(ticker: str, details: dict) -> tuple:
     return "—", None
 
 
-def compute_valuation_changes(ticker_list: list, details: dict, cache: dict) -> dict:
+def compute_valuation_changes(ticker_list: list, details: dict, metrics: dict,
+                               financials: dict, cache: dict) -> dict:
     """
-    Pick the smart valuation metric for each ticker and record a dated snapshot.
-    Computes YoY % change in the metric when a ~1Y-old snapshot exists.
+    Pick the smart valuation metric for each ticker and compute YoY change using
+    annual income statement data (revenue / net income growth ratios).
+
+    Math: multiple_change = (price_ratio / fundamental_ratio - 1) * 100
+      where price_ratio = 1 + return_1y
+            fundamental_ratio = yr0_metric / yr1_metric (revenue or net income)
+
+    If price grew faster than the fundamental, the multiple expanded (positive).
+    If fundamentals grew faster than price, the multiple contracted (negative).
+
     Returns {ticker: {"metric": str, "value": float|None, "change_1y": float|None}}.
     """
-    today_str  = datetime.now().strftime("%Y-%m-%d")
-    y1_target  = datetime.now() - timedelta(days=365)
     results: dict = {}
 
     for ticker in ticker_list:
         det = details.get(ticker, {})
+        met = metrics.get(ticker, {})
+        fin = financials.get(ticker, {})
         metric_name, metric_val = pick_smart_valuation(ticker, det)
 
-        snap_key = f"_valsnap_{ticker}"
-        snaps = dict(cache.get(snap_key, {}))
-        if metric_val is not None:
-            snaps[today_str] = {"metric": metric_name, "value": metric_val}
-            cutoff = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
-            snaps = {d: v for d, v in snaps.items() if d >= cutoff}
-            cache[snap_key] = snaps
-
         change_1y = None
-        if metric_val is not None:
-            best_date = None; best_dist = None
-            for snap_date in snaps:
-                if snap_date == today_str:
-                    continue
-                try:
-                    sd = datetime.strptime(snap_date, "%Y-%m-%d")
-                except Exception:
-                    continue
-                dist = abs((sd - y1_target).days)
-                if best_dist is None or dist < best_dist:
-                    best_dist = dist; best_date = snap_date
-            if best_date and best_dist is not None and best_dist < 90:
-                old = snaps[best_date]
-                if old.get("metric") == metric_name and old.get("value") and old["value"] > 0:
-                    change_1y = (metric_val - old["value"]) / old["value"] * 100
+        r1y = met.get("return_1y")
+
+        if metric_val is not None and r1y is not None:
+            price_ratio = 1 + r1y  # current price / 1Y-ago price
+
+            yr0_rev = fin.get("yr0_revenue")
+            yr1_rev = fin.get("yr1_revenue")
+            yr0_ni  = fin.get("yr0_net_income")
+            yr1_ni  = fin.get("yr1_net_income")
+
+            if metric_name == "P/S" and yr0_rev and yr1_rev and yr1_rev > 0:
+                # Revenue growth: yr0 is most recent FY, yr1 is prior FY
+                rev_ratio = yr0_rev / yr1_rev
+                if rev_ratio > 0:
+                    change_1y = (price_ratio / rev_ratio - 1) * 100
+
+            elif metric_name == "P/E" and yr0_ni and yr1_ni and yr1_ni > 0:
+                ni_ratio = yr0_ni / yr1_ni
+                if ni_ratio > 0:
+                    change_1y = (price_ratio / ni_ratio - 1) * 100
+
+            elif metric_name == "P/B":
+                # Book value grows slowly; use price return as crude approximation
+                # (positive = price rose faster than book = multiple expanded)
+                change_1y = r1y * 100
 
         results[ticker] = {"metric": metric_name, "value": metric_val, "change_1y": change_1y}
     return results
@@ -1643,16 +1709,18 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
             rows_html += f'<td class="fc10" style="{_chg_color(val_chg)}">{val_chg:+.1f}%</td>'
         else:
             rows_html += '<td class="fc10" style="color:#aaa">—</td>'
-        # fc11: aggregate ownership change YTD (pp)
+        # fc11: aggregate ownership change YTD (%)
         ytd_d = own_data.get("ytd_delta")
         if ytd_d is not None:
-            rows_html += f'<td class="fc11" style="{_chg_color(ytd_d)}">{ytd_d:+.1f}</td>'
+            ytd_disp = "NEW" if ytd_d >= 900 else f"{ytd_d:+.0f}%"
+            rows_html += f'<td class="fc11" style="{_chg_color(ytd_d)}">{ytd_disp}</td>'
         else:
             rows_html += '<td class="fc11" style="color:#aaa">—</td>'
-        # fc12: aggregate ownership change 1Y (pp)
+        # fc12: aggregate ownership change 1Y (%)
         y1_d = own_data.get("y1_delta")
         if y1_d is not None:
-            rows_html += f'<td class="fc12" style="{_chg_color(y1_d)}">{y1_d:+.1f}</td>'
+            y1_disp = "NEW" if y1_d >= 900 else f"{y1_d:+.0f}%"
+            rows_html += f'<td class="fc12" style="{_chg_color(y1_d)}">{y1_disp}</td>'
         else:
             rows_html += '<td class="fc12" style="color:#aaa">—</td>'
         for fn in fund_names:
@@ -2016,8 +2084,8 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
       <th class="fc8" onclick="sortTable(8)" style="cursor:pointer">5Y <span class="sort-icon">&#8597;</span></th>
       <th class="fc9"  onclick="sortTable(9)"  style="cursor:pointer" title="Sector-appropriate valuation metric">Val <span class="sort-icon">&#8597;</span></th>
       <th class="fc10" onclick="sortTable(10)" style="cursor:pointer" title="YoY change in valuation metric (stored snapshots; populates after 1 year)">Val &#916;1Y <span class="sort-icon">&#8597;</span></th>
-      <th class="fc11" onclick="sortTable(11)" style="cursor:pointer" title="Change in aggregate portfolio weight YTD (pp)">&#916;YTD <span class="sort-icon">&#8597;</span></th>
-      <th class="fc12" onclick="sortTable(12)" style="cursor:pointer" title="Change in aggregate portfolio weight vs 1 year ago (pp)">&#916;1Y <span class="sort-icon">&#8597;</span></th>
+      <th class="fc11" onclick="sortTable(11)" style="cursor:pointer" title="% change in aggregate portfolio weight YTD (NEW = brand new position)">&#916;YTD <span class="sort-icon">&#8597;</span></th>
+      <th class="fc12" onclick="sortTable(12)" style="cursor:pointer" title="% change in aggregate portfolio weight vs 1 year ago (NEW = brand new position)">&#916;1Y <span class="sort-icon">&#8597;</span></th>
       {th_funds}
     </tr>
     {filter_row_html}
@@ -2344,8 +2412,13 @@ def main() -> None:
     ownership_changes = compute_aggregate_changes(overlap, fund_data, all_cfg, cache)
     _save_cache(cache)
 
+    print("\nFetching annual financials for valuation change ...")
+    annual_financials = get_annual_financials(overlap_tickers, cache)
+    _save_cache(cache)
+
     print("\nComputing valuation metrics ...")
-    valuation_changes = compute_valuation_changes(overlap_tickers, company_details, cache)
+    valuation_changes = compute_valuation_changes(
+        overlap_tickers, company_details, company_metrics, annual_financials, cache)
     _save_cache(cache)
 
     print_report(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics)

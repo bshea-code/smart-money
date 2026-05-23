@@ -1065,6 +1065,233 @@ def fetch_fund_returns(all_cfg: dict, cache: dict) -> None:
         print(f"  [warn] fund return fetch failed: {exc}", file=sys.stderr)
 
 
+# ── Historical filing helpers ─────────────────────────────────────────────────
+
+def _fetch_13f_quarters(cik: str, n_q: int) -> list:
+    """Return up to n_q most-recent 13F-HR filings as [{"period", "holdings"}]."""
+    sub = get_submissions(cik)
+    recent = sub["filings"]["recent"]
+    acc_pairs = [
+        (dt, a)
+        for f, dt, a in zip(recent["form"], recent["filingDate"], recent["accessionNumber"])
+        if f == "13F-HR"
+    ]
+    results = []
+    for filing_date, acc in acc_pairs[:n_q]:
+        acc_nd = acc.replace("-", "")
+        try:
+            idx_html = fetch(f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nd}/")
+            xml_names = re.findall(
+                rf"/Archives/edgar/data/{cik}/{acc_nd}/([^\"/]+\.[xX][mM][lL])", idx_html)
+            info_url = next(
+                (f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nd}/{nm}"
+                 for nm in xml_names if "primary_doc" not in nm.lower()),
+                None)
+            if not info_url:
+                continue
+            holdings, _ = _parse_13f_xml(fetch(info_url))
+            results.append({
+                "period": filing_date,
+                "holdings": {c: {"pct": h["pct"], "val": h["val"]} for c, h in holdings.items()},
+            })
+        except Exception:
+            continue
+    return results
+
+
+def _fetch_nport_quarters(cik: str, series_name: str, n_q: int) -> list:
+    """Return up to n_q most-recent NPORT-P periods for the given series."""
+    sub = get_submissions(cik)
+    recent = sub["filings"]["recent"]
+    nport_pairs = [
+        (dt, acc)
+        for f, dt, acc in zip(recent["form"], recent["filingDate"], recent["accessionNumber"])
+        if f == "NPORT-P"
+    ]
+    batch_dates = sorted({dt for dt, _ in nport_pairs}, reverse=True)
+    results = []
+    for batch_date in batch_dates:
+        if len(results) >= n_q:
+            break
+        for acc in [a for dt, a in nport_pairs if dt == batch_date]:
+            acc_nd = acc.replace("-", "")
+            try:
+                xml_text = fetch(
+                    f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nd}/primary_doc.xml")
+            except Exception:
+                continue
+            m = re.search(r"<seriesName>([^<]+)</seriesName>", xml_text)
+            if not (m and m.group(1).strip() == series_name):
+                continue
+            period_m = re.search(r"<repPdDate>([^<]+)</repPdDate>", xml_text)
+            period = period_m.group(1) if period_m else batch_date
+            holdings, _ = _parse_nport_xml(xml_text)
+            results.append({
+                "period": period,
+                "holdings": {c: {"pct": h["pct"], "val": h["val"]} for c, h in holdings.items()},
+            })
+            break  # found the right series for this batch date
+    return results
+
+
+def fetch_multi_quarter_holdings(fn: str, cfg: dict, cache: dict, n_q: int = 6) -> list:
+    """Fetch up to n_q quarters of historical holdings for a fund. Cached 7 days."""
+    safe_key = re.sub(r"[^a-z0-9]", "_", fn.lower())
+    cache_key = f"_mhist_{safe_key}"
+    cached = cache.get(cache_key, {})
+    if _cache_fresh(cached, ttl_days=7) and cached.get("quarters"):
+        return cached["quarters"]
+    cik = cfg.get("cik", "")
+    quarters: list = []
+    if cik:
+        try:
+            if cfg.get("type") == "13f":
+                quarters = _fetch_13f_quarters(cik, n_q)
+            elif cfg.get("series_name"):
+                quarters = _fetch_nport_quarters(cik, cfg["series_name"], n_q)
+        except Exception as exc:
+            print(f"  [mhist] {fn}: {exc}", file=sys.stderr)
+    cache[cache_key] = {"quarters": quarters, "_ts": datetime.now().isoformat()}
+    if quarters:
+        print(f"  [{fn[:30]}] {len(quarters)} quarters of history fetched")
+    return quarters
+
+
+def _pick_quarter(quarters: list, target: date):
+    """Return the quarter entry with period closest to (but not after) target date."""
+    best = None
+    best_dist = None
+    for q in quarters:
+        try:
+            q_date = datetime.strptime(q["period"][:10], "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if q_date > target:
+            continue
+        dist = (target - q_date).days
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            best = q
+    return best
+
+
+def compute_aggregate_changes(overlap: list, fund_data: dict, all_cfg: dict,
+                               cache: dict) -> dict:
+    """
+    Returns {cusip: {"ytd_delta": float|None, "y1_delta": float|None}}.
+    Values are changes in aggregate portfolio weight (sum of % across all funds, in pp).
+    Positive = funds collectively added; negative = reduced.
+    """
+    print("Computing aggregate ownership changes ...")
+    today = datetime.now().date()
+    ytd_target = date(today.year, 1, 1)
+    y1_target  = today - timedelta(days=365)
+
+    fund_quarters: dict = {}
+    for fn, info in fund_data.items():
+        cfg = all_cfg.get(fn, {})
+        fund_quarters[fn] = fetch_multi_quarter_holdings(fn, cfg, cache)
+
+    results = {}
+    for cusip, data in overlap:
+        current_agg = sum(v for k, v in data.items() if not k.startswith("_"))
+        ytd_agg = 0.0; ytd_found = False
+        y1_agg  = 0.0; y1_found  = False
+        for fn, quarters in fund_quarters.items():
+            q_ytd = _pick_quarter(quarters, ytd_target)
+            if q_ytd is not None:
+                ytd_agg += q_ytd["holdings"].get(cusip, {}).get("pct", 0.0)
+                ytd_found = True
+            q_y1 = _pick_quarter(quarters, y1_target)
+            if q_y1 is not None:
+                y1_agg += q_y1["holdings"].get(cusip, {}).get("pct", 0.0)
+                y1_found = True
+        results[cusip] = {
+            "ytd_delta": (current_agg - ytd_agg) if ytd_found else None,
+            "y1_delta":  (current_agg - y1_agg)  if y1_found  else None,
+        }
+    return results
+
+
+# ── Smart valuation ───────────────────────────────────────────────────────────
+
+def pick_smart_valuation(ticker: str, details: dict) -> tuple:
+    """
+    Choose the most informative valuation metric based on sector/profitability.
+    Returns (metric_label, value_or_None).
+    - Financials: P/B
+    - Energy/Utilities: EV/EBITDA
+    - Unprofitable/high-growth tech: P/S
+    - Default: trailing P/E
+    """
+    sector   = (details.get("sector")   or "").lower()
+    industry = (details.get("industry") or "").lower()
+    pe  = details.get("trailing_pe")
+    ps  = details.get("ps_ratio")
+    pb  = details.get("pb_ratio")
+    ev  = details.get("ev_ebitda")
+
+    def ok(v):
+        return v is not None and 0 < v < 1000
+
+    if any(w in sector + " " + industry for w in ("financial", "bank", "insurance")):
+        if ok(pb):  return "P/B", pb
+    if sector in ("energy", "utilities"):
+        if ok(ev):  return "EV/EBITDA", ev
+    if not ok(pe) or pe > 80:
+        if ok(ps):  return "P/S", ps
+        if ok(ev):  return "EV/EBITDA", ev
+    if ok(pe):      return "P/E", pe
+    if ok(ps):      return "P/S", ps
+    if ok(ev):      return "EV/EBITDA", ev
+    if ok(pb):      return "P/B", pb
+    return "—", None
+
+
+def compute_valuation_changes(ticker_list: list, details: dict, cache: dict) -> dict:
+    """
+    Pick the smart valuation metric for each ticker and record a dated snapshot.
+    Computes YoY % change in the metric when a ~1Y-old snapshot exists.
+    Returns {ticker: {"metric": str, "value": float|None, "change_1y": float|None}}.
+    """
+    today_str  = datetime.now().strftime("%Y-%m-%d")
+    y1_target  = datetime.now() - timedelta(days=365)
+    results: dict = {}
+
+    for ticker in ticker_list:
+        det = details.get(ticker, {})
+        metric_name, metric_val = pick_smart_valuation(ticker, det)
+
+        snap_key = f"_valsnap_{ticker}"
+        snaps = dict(cache.get(snap_key, {}))
+        if metric_val is not None:
+            snaps[today_str] = {"metric": metric_name, "value": metric_val}
+            cutoff = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
+            snaps = {d: v for d, v in snaps.items() if d >= cutoff}
+            cache[snap_key] = snaps
+
+        change_1y = None
+        if metric_val is not None:
+            best_date = None; best_dist = None
+            for snap_date in snaps:
+                if snap_date == today_str:
+                    continue
+                try:
+                    sd = datetime.strptime(snap_date, "%Y-%m-%d")
+                except Exception:
+                    continue
+                dist = abs((sd - y1_target).days)
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist; best_date = snap_date
+            if best_date and best_dist is not None and best_dist < 90:
+                old = snaps[best_date]
+                if old.get("metric") == metric_name and old.get("value") and old["value"] > 0:
+                    change_1y = (metric_val - old["value"]) / old["value"] * 100
+
+        results[ticker] = {"metric": metric_name, "value": metric_val, "change_1y": change_1y}
+    return results
+
+
 # ── Position trend tracking ───────────────────────────────────────────────────
 
 def _prior_shares_13f(cik: str) -> dict:
@@ -1192,6 +1419,17 @@ def _pct_color(pct: float) -> str:
     return f"background:rgb({r},{g},{b});color:{fg}"
 
 
+def _chg_color(v) -> str:
+    """Green for positive change, red for negative."""
+    if v is None:
+        return "color:#aaa"
+    if v > 0:
+        return "color:#1a7a3a;font-weight:600"
+    if v < 0:
+        return "color:#b83232;font-weight:600"
+    return "color:#445"
+
+
 # ── Console report ────────────────────────────────────────────────────────────
 
 def print_report(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics):
@@ -1284,7 +1522,8 @@ def _fmt_mcap(mc) -> str:
 
 
 def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
-              company_details=None, etf_exposure=None, trends=None, sp500=None):
+              company_details=None, etf_exposure=None, trends=None, sp500=None,
+              ownership_changes=None, valuation_changes=None):
     now     = datetime.now().strftime("%B %d, %Y  %H:%M")
     n_funds = len(fund_names)
 
@@ -1324,8 +1563,9 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
             )
     cards_html += '</div>'
 
-    # Fixed left columns: # Funds, Ticker, Company, Mkt Cap, 1M, 3M, 1Y, 3Y, 5Y  (9 cols)
-    N_FIXED = 9
+    # Fixed left columns: # Funds, Ticker, Company, Mkt Cap, 1M, 3M, 1Y, 3Y, 5Y,
+    #                     Val, Val Δ1Y, Agg ΔYTD, Agg Δ1Y  (13 cols)
+    N_FIXED = 13
     cat_th_html = f'<th class="cat-fixed" colspan="{N_FIXED}"></th>'
     for bucket, cols in category_cols:
         cat_th_html += f'<th colspan="{len(cols)}" class="cat-header">{bucket}</th>'
@@ -1336,6 +1576,22 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
         f'<span class="th-label">{fn} <span class="sort-icon">&#8597;</span></span></th>'
         for i, fn in enumerate(fund_names)
     )
+
+    # Column filter row (3rd thead row)
+    _fc_phs = ["≥", "tkr", "name", "cap", "1M", "3M", "1Y", "3Y", "5Y",
+               "val", "Δval", "ΔYTD", "Δ1Y"]
+    _filter_fixed = "".join(
+        f'<th class="fc{i}"><input type="text" data-col="{i}" oninput="filterTable()" '
+        f'placeholder="{ph}" class="col-filter"></th>'
+        for i, ph in enumerate(_fc_phs)
+    )
+    _filter_funds = "".join(
+        f'<th style="min-width:62px;max-width:62px"><input type="text" '
+        f'data-col="{i + N_FIXED}" oninput="filterTable()" placeholder="" '
+        f'class="col-filter fund-col-filter"></th>'
+        for i in range(len(fund_names))
+    )
+    filter_row_html = f'<tr class="filter-row">{_filter_fixed}{_filter_funds}</tr>'
 
     # Table rows — no more group-header rows; # Funds is a data column
     rows_html = ""
@@ -1372,6 +1628,33 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
         rows_html += f'<td class="fc6" style="{_ret_color(r1y)}">{_fmt_return(r1y)}</td>'
         rows_html += f'<td class="fc7" style="{_ret_color(r3y)}">{_fmt_return(r3y)}</td>'
         rows_html += f'<td class="fc8" style="{_ret_color(r5y)}">{_fmt_return(r5y)}</td>'
+        # fc9: sector-appropriate valuation metric
+        val_data   = (valuation_changes  or {}).get(ticker, {})
+        own_data   = (ownership_changes  or {}).get(cusip,  {})
+        val_metric = val_data.get("metric", "—")
+        val_value  = val_data.get("value")
+        val_chg    = val_data.get("change_1y")
+        val_disp   = f'{val_value:.1f}' if val_value is not None else "—"
+        val_label  = f'<span style="font-size:.6rem;color:#88a;margin-left:2px">{val_metric}</span>' if val_metric != "—" else ""
+        rows_html += (f'<td class="fc9" title="{val_metric}" style="font-size:.78rem">'
+                      f'{val_disp}{val_label}</td>')
+        # fc10: YoY change in valuation metric
+        if val_chg is not None:
+            rows_html += f'<td class="fc10" style="{_chg_color(val_chg)}">{val_chg:+.1f}%</td>'
+        else:
+            rows_html += '<td class="fc10" style="color:#aaa">—</td>'
+        # fc11: aggregate ownership change YTD (pp)
+        ytd_d = own_data.get("ytd_delta")
+        if ytd_d is not None:
+            rows_html += f'<td class="fc11" style="{_chg_color(ytd_d)}">{ytd_d:+.1f}</td>'
+        else:
+            rows_html += '<td class="fc11" style="color:#aaa">—</td>'
+        # fc12: aggregate ownership change 1Y (pp)
+        y1_d = own_data.get("y1_delta")
+        if y1_d is not None:
+            rows_html += f'<td class="fc12" style="{_chg_color(y1_d)}">{y1_d:+.1f}</td>'
+        else:
+            rows_html += '<td class="fc12" style="color:#aaa">—</td>'
         for fn in fund_names:
             pct = data.get(fn)
             if pct is not None:
@@ -1545,37 +1828,69 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
   .legend span {{ display: inline-block; width: 20px; height: 14px; border-radius: 3px; }}
   .legend-label {{ font-size: .75rem; color: #778; }}
 
-  /* ── Frozen left columns ─────────────────────────────────────────────── */
-  td.fc0, td.fc1, td.fc2, td.fc3, td.fc4, td.fc5, td.fc6, td.fc7, td.fc8 {{
+  /* ── Frozen left columns (fc0–fc12) ─────────────────────────────────── */
+  td.fc0, td.fc1, td.fc2, td.fc3, td.fc4, td.fc5, td.fc6, td.fc7, td.fc8,
+  td.fc9, td.fc10, td.fc11, td.fc12 {{
     position: sticky; z-index: 2; background: #fff;
   }}
   tbody tr:nth-child(even) td.fc0, tbody tr:nth-child(even) td.fc1,
   tbody tr:nth-child(even) td.fc2, tbody tr:nth-child(even) td.fc3,
   tbody tr:nth-child(even) td.fc4, tbody tr:nth-child(even) td.fc5,
   tbody tr:nth-child(even) td.fc6, tbody tr:nth-child(even) td.fc7,
-  tbody tr:nth-child(even) td.fc8 {{ background: #fafbfd; }}
+  tbody tr:nth-child(even) td.fc8, tbody tr:nth-child(even) td.fc9,
+  tbody tr:nth-child(even) td.fc10, tbody tr:nth-child(even) td.fc11,
+  tbody tr:nth-child(even) td.fc12 {{ background: #fafbfd; }}
   tbody tr:hover td.fc0, tbody tr:hover td.fc1, tbody tr:hover td.fc2,
   tbody tr:hover td.fc3, tbody tr:hover td.fc4, tbody tr:hover td.fc5,
-  tbody tr:hover td.fc6, tbody tr:hover td.fc7, tbody tr:hover td.fc8 {{
-    background: #f0f4ff !important;
-  }}
+  tbody tr:hover td.fc6, tbody tr:hover td.fc7, tbody tr:hover td.fc8,
+  tbody tr:hover td.fc9, tbody tr:hover td.fc10, tbody tr:hover td.fc11,
+  tbody tr:hover td.fc12 {{ background: #f0f4ff !important; }}
   /* Column widths and left offsets — must sum correctly */
-  td.fc0, thead tr:last-child th.fc0 {{ left:   0px; width:  42px; min-width:  42px; }}
-  td.fc1, thead tr:last-child th.fc1 {{ left:  42px; width:  72px; min-width:  72px; }}
-  td.fc2, thead tr:last-child th.fc2 {{ left: 114px; width: 195px; min-width: 195px; max-width: 195px; }}
-  td.fc3, thead tr:last-child th.fc3 {{ left: 309px; width:  70px; min-width:  70px; }}
-  td.fc4, thead tr:last-child th.fc4 {{ left: 379px; width:  55px; min-width:  55px; }}
-  td.fc5, thead tr:last-child th.fc5 {{ left: 434px; width:  55px; min-width:  55px; }}
-  td.fc6, thead tr:last-child th.fc6 {{ left: 489px; width:  55px; min-width:  55px; }}
-  td.fc7, thead tr:last-child th.fc7 {{ left: 544px; width:  55px; min-width:  55px; }}
-  td.fc8, thead tr:last-child th.fc8 {{ left: 599px; width:  55px; min-width:  55px;
+  td.fc0,  thead tr.col-header-row th.fc0  {{ left:   0px; width:  42px; min-width:  42px; }}
+  td.fc1,  thead tr.col-header-row th.fc1  {{ left:  42px; width:  72px; min-width:  72px; }}
+  td.fc2,  thead tr.col-header-row th.fc2  {{ left: 114px; width: 195px; min-width: 195px; max-width: 195px; }}
+  td.fc3,  thead tr.col-header-row th.fc3  {{ left: 309px; width:  70px; min-width:  70px; }}
+  td.fc4,  thead tr.col-header-row th.fc4  {{ left: 379px; width:  55px; min-width:  55px; }}
+  td.fc5,  thead tr.col-header-row th.fc5  {{ left: 434px; width:  55px; min-width:  55px; }}
+  td.fc6,  thead tr.col-header-row th.fc6  {{ left: 489px; width:  55px; min-width:  55px; }}
+  td.fc7,  thead tr.col-header-row th.fc7  {{ left: 544px; width:  55px; min-width:  55px; }}
+  td.fc8,  thead tr.col-header-row th.fc8  {{ left: 599px; width:  55px; min-width:  55px; }}
+  td.fc9,  thead tr.col-header-row th.fc9  {{ left: 654px; width:  88px; min-width:  88px; }}
+  td.fc10, thead tr.col-header-row th.fc10 {{ left: 742px; width:  62px; min-width:  62px; }}
+  td.fc11, thead tr.col-header-row th.fc11 {{ left: 804px; width:  62px; min-width:  62px; }}
+  td.fc12, thead tr.col-header-row th.fc12 {{ left: 866px; width:  62px; min-width:  62px;
     border-right: 2px solid rgba(100,120,180,.25); }}
-  /* Freeze the first th in the category row (colspan=N_FIXED) */
+  /* Freeze the first th in the category row */
   thead tr:first-child th.cat-fixed {{ position: sticky; left: 0; z-index: 15; }}
-  /* Raise z-index on frozen header cells so they sit above sticky body cells */
-  thead tr:last-child th.fc0, thead tr:last-child th.fc1, thead tr:last-child th.fc2,
-  thead tr:last-child th.fc3, thead tr:last-child th.fc4, thead tr:last-child th.fc5,
-  thead tr:last-child th.fc6, thead tr:last-child th.fc7, thead tr:last-child th.fc8 {{ z-index: 15; }}
+  /* Raise z-index on frozen header cells */
+  thead tr.col-header-row th.fc0,  thead tr.col-header-row th.fc1,
+  thead tr.col-header-row th.fc2,  thead tr.col-header-row th.fc3,
+  thead tr.col-header-row th.fc4,  thead tr.col-header-row th.fc5,
+  thead tr.col-header-row th.fc6,  thead tr.col-header-row th.fc7,
+  thead tr.col-header-row th.fc8,  thead tr.col-header-row th.fc9,
+  thead tr.col-header-row th.fc10, thead tr.col-header-row th.fc11,
+  thead tr.col-header-row th.fc12 {{ z-index: 15; }}
+  /* ── Column filter row ───────────────────────────────────────────────── */
+  thead tr.filter-row th {{
+    position: sticky; top: 164px; z-index: 10;
+    background: #252e4a; padding: 3px 4px;
+    border-bottom: 2px solid #1a1a2e;
+  }}
+  thead tr.filter-row th.fc0,  thead tr.filter-row th.fc1,
+  thead tr.filter-row th.fc2,  thead tr.filter-row th.fc3,
+  thead tr.filter-row th.fc4,  thead tr.filter-row th.fc5,
+  thead tr.filter-row th.fc6,  thead tr.filter-row th.fc7,
+  thead tr.filter-row th.fc8,  thead tr.filter-row th.fc9,
+  thead tr.filter-row th.fc10, thead tr.filter-row th.fc11,
+  thead tr.filter-row th.fc12 {{ z-index: 16; }}
+  .col-filter {{
+    width: 100%; min-width: 0; padding: 2px 4px;
+    border: 1px solid #4a5570; border-radius: 3px;
+    font-size: .68rem; background: #1e2840; color: #cdd; outline: none;
+  }}
+  .col-filter:focus {{ border-color: #7ec8f8; }}
+  .col-filter::placeholder {{ color: #4a5a7a; }}
+  .fund-col-filter {{ width: 46px; }}
 
   /* ── Modal ── */
   .modal-overlay {{
@@ -1689,7 +2004,7 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
 <table id="mainTable">
   <thead>
     <tr>{cat_th_html}</tr>
-    <tr>
+    <tr class="col-header-row">
       <th class="fc0" onclick="sortTable(0)" style="cursor:pointer;text-align:center"># <span class="sort-icon">&#8597;</span></th>
       <th class="fc1" onclick="sortTable(1)" style="cursor:pointer;text-align:left">Ticker <span class="sort-icon">&#8597;</span></th>
       <th class="fc2" onclick="sortTable(2)" style="cursor:pointer;text-align:left">Company <span class="sort-icon">&#8597;</span></th>
@@ -1699,8 +2014,13 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
       <th class="fc6" onclick="sortTable(6)" style="cursor:pointer">1Y <span class="sort-icon">&#8597;</span></th>
       <th class="fc7" onclick="sortTable(7)" style="cursor:pointer">3Y <span class="sort-icon">&#8597;</span></th>
       <th class="fc8" onclick="sortTable(8)" style="cursor:pointer">5Y <span class="sort-icon">&#8597;</span></th>
+      <th class="fc9"  onclick="sortTable(9)"  style="cursor:pointer" title="Sector-appropriate valuation metric">Val <span class="sort-icon">&#8597;</span></th>
+      <th class="fc10" onclick="sortTable(10)" style="cursor:pointer" title="YoY change in valuation metric (stored snapshots; populates after 1 year)">Val &#916;1Y <span class="sort-icon">&#8597;</span></th>
+      <th class="fc11" onclick="sortTable(11)" style="cursor:pointer" title="Change in aggregate portfolio weight YTD (pp)">&#916;YTD <span class="sort-icon">&#8597;</span></th>
+      <th class="fc12" onclick="sortTable(12)" style="cursor:pointer" title="Change in aggregate portfolio weight vs 1 year ago (pp)">&#916;1Y <span class="sort-icon">&#8597;</span></th>
       {th_funds}
     </tr>
+    {filter_row_html}
   </thead>
   <tbody>{rows_html}</tbody>
 </table>
@@ -1899,10 +2219,43 @@ function sortTable(col) {{
   rows.forEach(r => tbody.appendChild(r));
 }}
 
+function matchFilter(cellText, fval) {{
+  const s = cellText.replace(/[+%,$★▲▼◆]/g, '').trim();
+  const cmp = fval.match(/^([><]=?)\s*(-?\d+\.?\d*)$/);
+  if (cmp) {{
+    const n = parseFloat(s), t = parseFloat(cmp[2]);
+    if (isNaN(n)) return false;
+    switch (cmp[1]) {{
+      case '>':  return n > t;
+      case '>=': return n >= t;
+      case '<':  return n < t;
+      case '<=': return n <= t;
+    }}
+  }}
+  if (fval === '!') return s !== '—' && s !== '';
+  return s.toLowerCase().includes(fval.toLowerCase());
+}}
+
 function filterTable() {{
-  const q = document.getElementById('filterBox').value.toLowerCase();
+  const globalQ = document.getElementById('filterBox')?.value.toLowerCase() || '';
+  const colF = {{}};
+  document.querySelectorAll('.filter-row input[data-col]').forEach(inp => {{
+    const v = inp.value.trim();
+    if (v) colF[parseInt(inp.dataset.col)] = v;
+  }});
+  const active = globalQ || Object.keys(colF).length > 0;
   document.querySelectorAll('#mainTable tbody tr').forEach(r => {{
-    r.classList.toggle('filtered-out', q.length > 0 && !r.innerText.toLowerCase().includes(q));
+    if (!active) {{ r.classList.remove('filtered-out'); return; }}
+    if (globalQ && !r.innerText.toLowerCase().includes(globalQ)) {{
+      r.classList.add('filtered-out'); return;
+    }}
+    for (const [col, fval] of Object.entries(colF)) {{
+      const cell = r.cells[col];
+      if (!cell || !matchFilter(cell.innerText, fval)) {{
+        r.classList.add('filtered-out'); return;
+      }}
+    }}
+    r.classList.remove('filtered-out');
   }});
 }}
 </script>
@@ -1986,12 +2339,20 @@ def main() -> None:
 
     print("\nComputing position trends ...")
     trends = get_fund_trends(fund_data, all_cfg, cache)
+
+    print("\nComputing aggregate ownership changes (historical EDGAR filings) ...")
+    ownership_changes = compute_aggregate_changes(overlap, fund_data, all_cfg, cache)
+    _save_cache(cache)
+
+    print("\nComputing valuation metrics ...")
+    valuation_changes = compute_valuation_changes(overlap_tickers, company_details, cache)
     _save_cache(cache)
 
     print_report(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics)
     save_csv(overlap, fund_names, tickers, company_metrics)
     save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
-              company_details, etf_exposure, trends, sp500)
+              company_details, etf_exposure, trends, sp500,
+              ownership_changes, valuation_changes)
 
 
 if __name__ == "__main__":

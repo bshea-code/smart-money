@@ -2241,6 +2241,15 @@ function showTab(tab, btn) {{
 
 document.addEventListener('keydown', e => {{ if (e.key === 'Escape') closeModal(); }});
 
+// Fix filter-row sticky top to match actual rendered header heights
+(function() {{
+  const rows = document.querySelectorAll('#mainTable thead tr');
+  if (rows.length >= 3) {{
+    const top = rows[0].offsetHeight + rows[1].offsetHeight;
+    rows[2].querySelectorAll('th').forEach(th => th.style.top = top + 'px');
+  }}
+}})();
+
 function toggleFunds(btn) {{
   const grid = btn.nextElementSibling;
   const collapsed = grid.classList.toggle('collapsed');

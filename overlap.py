@@ -1940,7 +1940,7 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
   thead tr.col-header-row th.fc12 {{ z-index: 15; }}
   /* ── Column filter row ───────────────────────────────────────────────── */
   thead tr.filter-row th {{
-    position: sticky; top: 164px; z-index: 10;
+    position: sticky; top: 9999px; z-index: 10;
     background: #252e4a; padding: 3px 4px;
     border-bottom: 2px solid #1a1a2e;
   }}
@@ -2241,14 +2241,17 @@ function showTab(tab, btn) {{
 
 document.addEventListener('keydown', e => {{ if (e.key === 'Escape') closeModal(); }});
 
-// Fix filter-row sticky top to match actual rendered header heights
-(function() {{
+// Fix filter-row sticky top to match actual rendered header heights.
+// Must run after layout is complete; getBoundingClientRect() is reliable post-load.
+function _fixFilterTop() {{
   const rows = document.querySelectorAll('#mainTable thead tr');
   if (rows.length >= 3) {{
-    const top = rows[0].offsetHeight + rows[1].offsetHeight;
-    rows[2].querySelectorAll('th').forEach(th => th.style.top = top + 'px');
+    const h = rows[0].getBoundingClientRect().height
+             + rows[1].getBoundingClientRect().height;
+    if (h > 0) rows[2].querySelectorAll('th').forEach(th => th.style.top = h + 'px');
   }}
-}})();
+}}
+window.addEventListener('load', _fixFilterTop);
 
 function toggleFunds(btn) {{
   const grid = btn.nextElementSibling;

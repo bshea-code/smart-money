@@ -1632,13 +1632,18 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
     # Fixed left columns: # Funds, Ticker, Company, Mkt Cap, 1M, 3M, 1Y, 3Y, 5Y,
     #                     Val, Val Δ1Y, Agg ΔYTD, Agg Δ1Y  (13 cols)
     N_FIXED = 13
-    cat_th_html = f'<th class="cat-fixed" colspan="{N_FIXED}"></th>'
+    cat_th_html = (
+        '<th class="cat-fixed cat-header" colspan="4">Company</th>'
+        '<th colspan="5" class="cat-header cat-perf">Performance</th>'
+        '<th colspan="2" class="cat-header cat-val">Valuation</th>'
+        '<th colspan="2" class="cat-header cat-agg">Agg Weight</th>'
+    )
     for bucket, cols in category_cols:
-        cat_th_html += f'<th colspan="{len(cols)}" class="cat-header">{bucket}</th>'
+        cat_th_html += f'<th colspan="{len(cols)}" class="cat-header cat-fund-group">{bucket}</th>'
 
     # Fund column headers (rotated), offset by N_FIXED; data-fund for hover tooltip
     th_funds = "".join(
-        f'<th class="fund-col" onclick="sortTable({i + N_FIXED})" data-fund="{fn}">'
+        f'<th class="fund-col" onclick="sortTable({i + N_FIXED})" data-fund="{fn}" data-fund-idx="{i}">'
         f'<span class="th-label">{fn} <span class="sort-icon">&#8597;</span></span></th>'
         for i, fn in enumerate(fund_names)
     )
@@ -1652,7 +1657,7 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
         for i, ph in enumerate(_fc_phs)
     )
     _filter_funds = "".join(
-        f'<th style="min-width:62px;max-width:62px"><input type="text" '
+        f'<th style="min-width:62px;max-width:62px" data-fund-idx="{i}"><input type="text" '
         f'data-col="{i + N_FIXED}" oninput="filterTable()" placeholder="" '
         f'class="col-filter fund-col-filter"></th>'
         for i in range(len(fund_names))
@@ -1676,7 +1681,7 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
         own_tip  = f" (max {max_own:.1f}% of co.)" if max_own else ""
 
         safe_name = name.replace("'", "\\'")
-        rows_html += f'\n  <tr>'
+        rows_html += f'\n  <tr onclick="toggleRowSelect(this)">'
         rows_html += f'<td class="n-funds fc0">{fund_count}</td>'
         rows_html += (
             f'<td class="ticker ticker-link fc1" title="{ticker}{own_tip}" '
@@ -1723,7 +1728,7 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
             rows_html += f'<td class="fc12" style="{_chg_color(y1_d)}">{y1_disp}</td>'
         else:
             rows_html += '<td class="fc12" style="color:#aaa">—</td>'
-        for fn in fund_names:
+        for fi, fn in enumerate(fund_names):
             pct = data.get(fn)
             if pct is not None:
                 own = data.get(f"_own_{fn}")
@@ -1737,9 +1742,10 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
                     arrow = '<span class="tr-new">★</span>'
                 else:
                     arrow = ""
-                rows_html += f'<td class="fund-val" style="{_pct_color(pct)}"{tip}>{pct:.2f}%{arrow}</td>'
+                rows_html += (f'<td class="fund-val" data-fund-idx="{fi}" data-weight="{pct}"'
+                              f' style="{_pct_color(pct)}"{tip}>{pct:.2f}%{arrow}</td>')
             else:
-                rows_html += '<td class="fund-val empty">—</td>'
+                rows_html += f'<td class="fund-val empty" data-fund-idx="{fi}" data-weight="0">—</td>'
         rows_html += "\n  </tr>"
 
     # JSON blobs for the modal and fund tooltip
@@ -1843,10 +1849,14 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
   }}
   table {{ border-collapse: collapse; width: 100%; font-size: .82rem;
            background: #fff; }}
+  thead {{ background: #1a1a2e; }}
 
   thead th {{ background: #1a1a2e; color: #fff; padding: 8px 12px;
               text-align: right; white-space: nowrap;
               position: sticky; top: 0; z-index: 10; cursor: default; }}
+  thead tr:first-child th {{ height: 30px; }}
+  thead tr.col-header-row th {{ top: 30px; }}
+  thead tr.filter-row th {{ top: 160px; }}
   thead th:first-child, thead th:nth-child(2) {{ text-align: left; }}
   thead th.cat-header {{ background: #2d3a5a; font-size: .7rem;
                          letter-spacing: .06em; text-transform: uppercase;
@@ -1866,7 +1876,14 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
   }}
   .sort-icon {{ margin-left: 3px; opacity: .45; font-size: .65rem; }}
 
+  tbody tr {{ cursor: pointer; }}
   tbody tr:hover td {{ background: #f0f4ff !important; color: #000 !important; }}
+  tbody tr.row-selected td {{ background: #dce8ff !important; color: #000 !important; }}
+  .sort-mode-banner {{
+    display: none; padding: 5px 16px; background: #2d3a5a; color: #adf;
+    font-size: .72rem; border-bottom: 1px solid #1a1a2e; text-align: center;
+  }}
+  .sort-mode-banner.active {{ display: block; }}
   tbody tr:nth-child(even) {{ background: #fafbfd; }}
   td {{ padding: 6px 10px; border-bottom: 1px solid #eef;
         text-align: right; white-space: nowrap; font-size: .82rem; }}
@@ -1914,22 +1931,29 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
   tbody tr:hover td.fc9, tbody tr:hover td.fc10, tbody tr:hover td.fc11,
   tbody tr:hover td.fc12 {{ background: #f0f4ff !important; }}
   /* Column widths and left offsets — must sum correctly */
-  td.fc0,  thead tr.col-header-row th.fc0  {{ left:   0px; width:  42px; min-width:  42px; }}
-  td.fc1,  thead tr.col-header-row th.fc1  {{ left:  42px; width:  72px; min-width:  72px; }}
-  td.fc2,  thead tr.col-header-row th.fc2  {{ left: 114px; width: 195px; min-width: 195px; max-width: 195px; }}
-  td.fc3,  thead tr.col-header-row th.fc3  {{ left: 309px; width:  70px; min-width:  70px; }}
-  td.fc4,  thead tr.col-header-row th.fc4  {{ left: 379px; width:  55px; min-width:  55px; }}
-  td.fc5,  thead tr.col-header-row th.fc5  {{ left: 434px; width:  55px; min-width:  55px; }}
-  td.fc6,  thead tr.col-header-row th.fc6  {{ left: 489px; width:  55px; min-width:  55px; }}
-  td.fc7,  thead tr.col-header-row th.fc7  {{ left: 544px; width:  55px; min-width:  55px; }}
-  td.fc8,  thead tr.col-header-row th.fc8  {{ left: 599px; width:  55px; min-width:  55px; }}
-  td.fc9,  thead tr.col-header-row th.fc9  {{ left: 654px; width:  88px; min-width:  88px; }}
-  td.fc10, thead tr.col-header-row th.fc10 {{ left: 742px; width:  62px; min-width:  62px; }}
-  td.fc11, thead tr.col-header-row th.fc11 {{ left: 804px; width:  62px; min-width:  62px; }}
-  td.fc12, thead tr.col-header-row th.fc12 {{ left: 866px; width:  62px; min-width:  62px;
+  td.fc0,  thead th.fc0  {{ left:   0px; width:  42px; min-width:  42px; }}
+  td.fc1,  thead th.fc1  {{ left:  42px; width:  72px; min-width:  72px; }}
+  td.fc2,  thead th.fc2  {{ left: 114px; width: 195px; min-width: 195px; max-width: 195px; }}
+  td.fc3,  thead th.fc3  {{ left: 309px; width:  70px; min-width:  70px; }}
+  td.fc4,  thead th.fc4  {{ left: 379px; width:  55px; min-width:  55px; }}
+  td.fc5,  thead th.fc5  {{ left: 434px; width:  55px; min-width:  55px; }}
+  td.fc6,  thead th.fc6  {{ left: 489px; width:  55px; min-width:  55px; }}
+  td.fc7,  thead th.fc7  {{ left: 544px; width:  55px; min-width:  55px; }}
+  td.fc8,  thead th.fc8  {{ left: 599px; width:  55px; min-width:  55px; }}
+  td.fc9,  thead th.fc9  {{ left: 654px; width:  88px; min-width:  88px; }}
+  td.fc10, thead th.fc10 {{ left: 742px; width:  62px; min-width:  62px; }}
+  td.fc11, thead th.fc11 {{ left: 804px; width:  62px; min-width:  62px; }}
+  td.fc12, thead th.fc12 {{ left: 866px; width:  62px; min-width:  62px;
     border-right: 2px solid rgba(100,120,180,.25); }}
   /* Freeze the first th in the category row */
-  thead tr:first-child th.cat-fixed {{ position: sticky; left: 0; z-index: 15; }}
+  thead tr:first-child th.cat-fixed {{ position: sticky; left:   0px; z-index: 15;
+    border-left: none; border-right: 2px solid rgba(100,120,180,.35); }}
+  thead tr:first-child th.cat-perf  {{ position: sticky; left: 379px; z-index: 15;
+    border-left: none; border-right: 2px solid rgba(100,120,180,.35); }}
+  thead tr:first-child th.cat-val   {{ position: sticky; left: 654px; z-index: 15;
+    border-left: none; border-right: 2px solid rgba(100,120,180,.35); }}
+  thead tr:first-child th.cat-agg   {{ position: sticky; left: 804px; z-index: 15;
+    border-left: none; border-right: 2px solid rgba(100,120,180,.35); }}
   /* Raise z-index on frozen header cells */
   thead tr.col-header-row th.fc0,  thead tr.col-header-row th.fc1,
   thead tr.col-header-row th.fc2,  thead tr.col-header-row th.fc3,
@@ -1940,7 +1964,6 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
   thead tr.col-header-row th.fc12 {{ z-index: 15; }}
   /* ── Column filter row ───────────────────────────────────────────────── */
   thead tr.filter-row th {{
-    position: sticky; top: 9999px; z-index: 10;
     background: #252e4a; padding: 3px 4px;
     border-bottom: 2px solid #1a1a2e;
   }}
@@ -2068,6 +2091,9 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
   </div>
 </div>
 
+<div id="sortModeBanner" class="sort-mode-banner">
+  Funds sorted by weight for <strong id="sortBannerTicker"></strong> — click the row again to restore original order
+</div>
 <div class="table-outer"><div class="table-wrap">
 <table id="mainTable">
   <thead>
@@ -2241,17 +2267,146 @@ function showTab(tab, btn) {{
 
 document.addEventListener('keydown', e => {{ if (e.key === 'Escape') closeModal(); }});
 
-// Fix filter-row sticky top to match actual rendered header heights.
-// Must run after layout is complete; getBoundingClientRect() is reliable post-load.
-function _fixFilterTop() {{
-  const rows = document.querySelectorAll('#mainTable thead tr');
-  if (rows.length >= 3) {{
-    const h = rows[0].getBoundingClientRect().height
-             + rows[1].getBoundingClientRect().height;
-    if (h > 0) rows[2].querySelectorAll('th').forEach(th => th.style.top = h + 'px');
+// Fix multi-row sticky thead: measure actual row heights, apply top offsets to BOTH
+// col-header row AND filter row so they stack correctly below the category row.
+// Uses !important to win over any CSS specificity, and multiple timing hooks so it
+// fires before the user can scroll (even on slow connections).
+(function() {{
+  function applyHeaderTops() {{
+    var rows = document.querySelectorAll('#mainTable thead tr');
+    if (rows.length < 3) return;
+    var h0 = rows[0].getBoundingClientRect().height;
+    var h1 = rows[1].getBoundingClientRect().height;
+    if (h0 < 1 || h1 < 1) return;   // layout not ready yet
+    var top1 = Math.ceil(h0) + 'px';
+    var top2 = Math.ceil(h0 + h1) + 'px';
+    rows[1].querySelectorAll('th').forEach(function(th) {{
+      th.style.setProperty('top', top1, 'important');
+    }});
+    rows[2].querySelectorAll('th').forEach(function(th) {{
+      th.style.setProperty('top', top2, 'important');
+    }});
   }}
-}}
-window.addEventListener('load', _fixFilterTop);
+  // Fire at every reliable layout checkpoint
+  var raf2 = function(fn) {{ requestAnimationFrame(function() {{ requestAnimationFrame(fn); }}); }};
+  if (document.readyState === 'loading') {{
+    document.addEventListener('DOMContentLoaded', function() {{ raf2(applyHeaderTops); }});
+  }} else {{
+    raf2(applyHeaderTops);
+  }}
+  window.addEventListener('load', applyHeaderTops);
+  // Re-apply if the header rows resize (e.g. window width change)
+  if (typeof ResizeObserver !== 'undefined') {{
+    var obs = new ResizeObserver(function() {{ raf2(applyHeaderTops); }});
+    var r0 = document.querySelector('#mainTable thead tr:first-child');
+    var r1 = document.querySelector('#mainTable thead tr.col-header-row');
+    if (r0) obs.observe(r0);
+    if (r1) obs.observe(r1);
+  }}
+}})();
+
+// ── Row-select + fund column sort by weight ──────────────────────────────────
+(function() {{
+  var _sel = null;          // currently selected <tr>
+  var _origCatCells = null; // saved outerHTML of .cat-fund-group cells
+
+  window.toggleRowSelect = function(tr) {{
+    if (_sel === tr) {{ _deselect(); return; }}
+    if (_sel) _deselect();
+    _sel = tr;
+    tr.classList.add('row-selected');
+
+    // Build weight map: fundIdx → weight
+    var wmap = {{}};
+    tr.querySelectorAll('td[data-fund-idx]').forEach(function(td) {{
+      wmap[+td.dataset.fundIdx] = parseFloat(td.dataset.weight) || 0;
+    }});
+    var n = Object.keys(wmap).length;
+    var order = Array.from({{length: n}}, function(_, i) {{ return i; }})
+      .sort(function(a, b) {{ return wmap[b] - wmap[a]; }});
+
+    _reorder(order);
+
+    var ticker = (tr.querySelector('td.ticker') || {{}}).textContent || '';
+    document.getElementById('sortBannerTicker').textContent = ticker.trim();
+    document.getElementById('sortModeBanner').classList.add('active');
+  }};
+
+  function _deselect() {{
+    if (!_sel) return;
+    _sel.classList.remove('row-selected');
+    _sel = null;
+    var n = document.querySelectorAll(
+      '#mainTable thead tr.col-header-row th[data-fund-idx]').length;
+    _reorder(Array.from({{length: n}}, function(_, i) {{ return i; }}));
+    document.getElementById('sortModeBanner').classList.remove('active');
+  }}
+
+  function _reorder(order) {{
+    // Reorder fund cells in every row (thead + tbody)
+    document.querySelectorAll('#mainTable tr').forEach(function(tr) {{
+      var cells = tr.querySelectorAll('[data-fund-idx]');
+      if (!cells.length) return;
+      var byIdx = {{}};
+      cells.forEach(function(c) {{ byIdx[+c.dataset.fundIdx] = c; }});
+      var parent = cells[0].parentNode;
+      // anchor = the node that comes right after the last fund cell
+      var anchor = cells[cells.length - 1].nextSibling || null;
+      order.forEach(function(origIdx) {{
+        var c = byIdx[origIdx];
+        if (c) parent.insertBefore(c, anchor);
+      }});
+    }});
+
+    // Swap the category-row fund-group cells for a "sorted" placeholder, or restore
+    var catRow = document.querySelector('#mainTable thead tr:first-child');
+    var groups = catRow ? catRow.querySelectorAll('th.cat-fund-group') : [];
+    var isDefault = order.every(function(v, i) {{ return v === i; }});
+
+    if (!isDefault && groups.length && !_origCatCells) {{
+      // Save and replace fund-group cells with a single spanning cell
+      _origCatCells = Array.from(groups).map(function(th) {{ return th.outerHTML; }}).join('');
+      var totalFunds = order.length;
+      var placeholder = document.createElement('th');
+      placeholder.id = 'cat-sort-placeholder';
+      placeholder.className = 'cat-header';
+      placeholder.colSpan = totalFunds;
+      placeholder.style.cssText = 'font-style:italic;letter-spacing:0;color:#adf';
+      placeholder.textContent = 'funds sorted by weight ↓';
+      var first = groups[0];
+      var par = first.parentNode;
+      var ref = first.nextSibling;
+      groups.forEach(function(th) {{ par.removeChild(th); }});
+      par.insertBefore(placeholder, ref);
+    }} else if (isDefault && _origCatCells) {{
+      // Restore original fund-group cells
+      var ph = document.getElementById('cat-sort-placeholder');
+      if (ph) {{
+        var par = ph.parentNode;
+        var ref = ph.nextSibling;
+        par.removeChild(ph);
+        var tmp = document.createElement('table');
+        tmp.innerHTML = '<thead><tr>' + _origCatCells + '</tr></thead>';
+        var restored = tmp.querySelectorAll('th');
+        restored.forEach(function(th) {{ par.insertBefore(th, ref); }});
+      }}
+      _origCatCells = null;
+    }}
+
+    // Keep sortTable() column indices correct after reorder
+    document.querySelectorAll(
+      '#mainTable thead tr.col-header-row th[data-fund-idx]'
+    ).forEach(function(th, pos) {{
+      th.onclick = (function(col) {{ return function() {{ sortTable(col); }}; }})(
+        {N_FIXED} + pos);
+    }});
+  }}
+
+  // Click outside table deselects
+  document.addEventListener('click', function(e) {{
+    if (_sel && !e.target.closest('#mainTable tbody tr')) _deselect();
+  }});
+}})();
 
 function toggleFunds(btn) {{
   const grid = btn.nextElementSibling;
@@ -2285,6 +2440,19 @@ function toggleFunds(btn) {{
   }});
 }}());
 
+function _toNum(s) {{
+  const t = s.replace(/[$,+%★▲▼◆]/g, '').trim();
+  if (t === 'NEW') return 9999;
+  const m = t.match(/^(-?[\d.]+)([TBMKtbmk]?)$/);
+  if (!m) return NaN;
+  const v = parseFloat(m[1]), sfx = m[2].toUpperCase();
+  if (sfx === 'T') return v * 1e12;
+  if (sfx === 'B') return v * 1e9;
+  if (sfx === 'M') return v * 1e6;
+  if (sfx === 'K') return v * 1e3;
+  return v;
+}}
+
 function sortTable(col) {{
   const tbody = document.querySelector('#mainTable tbody');
   const rows = Array.from(tbody.querySelectorAll('tr'));
@@ -2292,7 +2460,7 @@ function sortTable(col) {{
   rows.sort((a, b) => {{
     const ca = a.cells[col]?.innerText.trim() || '';
     const cb = b.cells[col]?.innerText.trim() || '';
-    const na = parseFloat(ca), nb = parseFloat(cb);
+    const na = _toNum(ca), nb = _toNum(cb);
     if (!isNaN(na) && !isNaN(nb)) return dir * (na - nb);
     return dir * ca.localeCompare(cb);
   }});

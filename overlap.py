@@ -2108,7 +2108,7 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
       <th class="fc6" onclick="sortTable(6)" style="cursor:pointer">1Y <span class="sort-icon">&#8597;</span></th>
       <th class="fc7" onclick="sortTable(7)" style="cursor:pointer">3Y <span class="sort-icon">&#8597;</span></th>
       <th class="fc8" onclick="sortTable(8)" style="cursor:pointer">5Y <span class="sort-icon">&#8597;</span></th>
-      <th class="fc9"  onclick="sortTable(9)"  style="cursor:pointer" title="Sector-appropriate valuation metric">Val <span class="sort-icon">&#8597;</span></th>
+      <th class="fc9"  onclick="sortTable(9)"  style="cursor:pointer" title="Sector-appropriate valuation metric">Trail<br>Valtn <span class="sort-icon">&#8597;</span></th>
       <th class="fc10" onclick="sortTable(10)" style="cursor:pointer" title="YoY change in valuation metric (stored snapshots; populates after 1 year)">Val &#916;1Y <span class="sort-icon">&#8597;</span></th>
       <th class="fc11" onclick="sortTable(11)" style="cursor:pointer" title="% change in aggregate portfolio weight YTD (NEW = brand new position)">&#916;YTD <span class="sort-icon">&#8597;</span></th>
       <th class="fc12" onclick="sortTable(12)" style="cursor:pointer" title="% change in aggregate portfolio weight vs 1 year ago (NEW = brand new position)">&#916;1Y <span class="sort-icon">&#8597;</span></th>

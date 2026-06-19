@@ -30,17 +30,17 @@ EDGAR_UA = "SmartMoneyOverlap brianrshea@gmail.com"
 
 # Pinned funds always included regardless of auto-discovery
 PINNED_FUNDS = {
-    "FDGRX (Wymer)": {
+    "FDGRX (Fid Growth)": {
         "type": "nport", "cik": "707823",
         "series_name": "Fidelity Growth Company Fund",
         "category": "Large Cap Growth", "fund_ticker": "FDGRX",
     },
-    "FBGRX (Kalra)": {
+    "FBGRX (Fid Blue Chip Growth)": {
         "type": "nport", "cik": "754510",
         "series_name": "Fidelity Blue Chip Growth Fund",
         "category": "Large Cap Growth", "fund_ticker": "FBGRX",
     },
-    "FOCPX (Lee)": {
+    "FOCPX (Fid OTC)": {
         "type": "nport", "cik": "754510",
         "series_name": "Fidelity OTC Portfolio",
         "category": "Large Cap Growth", "fund_ticker": "FOCPX",
@@ -1940,7 +1940,7 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
   td.fc6,  thead th.fc6  {{ left: 489px; width:  55px; min-width:  55px; }}
   td.fc7,  thead th.fc7  {{ left: 544px; width:  55px; min-width:  55px; }}
   td.fc8,  thead th.fc8  {{ left: 599px; width:  55px; min-width:  55px; }}
-  td.fc9,  thead th.fc9  {{ left: 654px; width:  88px; min-width:  88px; }}
+  td.fc9,  thead th.fc9  {{ left: 654px; width:  88px; min-width:  88px; box-shadow: 1px 0 0 rgba(100,120,180,.2); }}
   td.fc10, thead th.fc10 {{ left: 742px; width:  62px; min-width:  62px; }}
   td.fc11, thead th.fc11 {{ left: 804px; width:  62px; min-width:  62px; }}
   td.fc12, thead th.fc12 {{ left: 866px; width:  62px; min-width:  62px;
@@ -1954,6 +1954,8 @@ def save_html(overlap, fund_names, fund_data, all_cfg, tickers, company_metrics,
     border-left: none; border-right: 2px solid rgba(100,120,180,.35); }}
   thead tr:first-child th.cat-agg   {{ position: sticky; left: 804px; z-index: 15;
     border-left: none; border-right: 2px solid rgba(100,120,180,.35); }}
+  /* Fund-group cells sit above fund-col overflow text (which bleeds up due to rotation) */
+  thead tr:first-child th.cat-fund-group {{ z-index: 13; }}
   /* Raise z-index on frozen header cells */
   thead tr.col-header-row th.fc0,  thead tr.col-header-row th.fc1,
   thead tr.col-header-row th.fc2,  thead tr.col-header-row th.fc3,
